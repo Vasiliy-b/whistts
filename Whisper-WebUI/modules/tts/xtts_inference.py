@@ -1,5 +1,18 @@
+# Patch torch._dynamo before any imports (required for torch 2.2.0 + transformers 4.44.2)
+import sys
 import os
-import io
+
+class _FakeDynamo:
+    @staticmethod
+    def is_compiling():
+        return False
+
+if 'torch._dynamo' not in sys.modules:
+    sys.modules['torch._dynamo'] = _FakeDynamo()
+
+# Auto-agree to Coqui TOS for non-interactive usage
+os.environ.setdefault('COQUI_TOS_AGREED', '1')
+
 import torch
 import gradio as gr
 import numpy as np
@@ -9,6 +22,16 @@ from modules.tts.tts_base import TTSBase, TTS_MODELS_DIR, XTTS_LANGUAGES
 from modules.utils.logger import get_logger
 
 logger = get_logger()
+
+
+# Optimized inference parameters (tested for Polish lector-style dubbing)
+DEFAULT_TTS_PARAMS = {
+    'temperature': 0.45,      # Lower = more stable/consistent
+    'top_p': 0.85,            # Nucleus sampling threshold
+    'top_k': 35,              # Limits vocabulary choices
+    'repetition_penalty': 15.0,  # Prevents repetitive patterns
+    'length_penalty': 1.1,    # Slightly longer pauses
+}
 
 
 class XTTSInference(TTSBase):
@@ -34,6 +57,7 @@ class XTTSInference(TTSBase):
         self.sample_rate = 24000  # XTTS default
         self.available_languages = list(XTTS_LANGUAGES.keys())
         self.default_speaker_wav = None
+        self.tts_params = DEFAULT_TTS_PARAMS.copy()
         
     def load_model(self, progress: gr.Progress = gr.Progress()):
         """Load XTTS v2 model"""
@@ -44,57 +68,18 @@ class XTTSInference(TTSBase):
         progress(0.1, desc="Loading XTTS v2 model...")
         
         try:
-            from TTS.tts.configs.xtts_config import XttsConfig
-            from TTS.tts.models.xtts import Xtts
+            # Try direct model loading first (faster if already downloaded)
+            from TTS.api import TTS
             
-            # Model path
-            model_path = os.path.join(self.model_dir, "xtts_v2")
+            progress(0.3, desc="Initializing XTTS v2...")
+            tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
             
-            # Download if not exists
-            if not os.path.exists(model_path):
-                progress(0.2, desc="Downloading XTTS v2 model (~1.8GB)...")
-                os.makedirs(model_path, exist_ok=True)
-                
-                # Use TTS library's download mechanism
-                from TTS.utils.manage import ModelManager
-                manager = ModelManager()
-                model_path, config_path, _ = manager.download_model("tts_models/multilingual/multi-dataset/xtts_v2")
-                
-                logger.info(f"XTTS model downloaded to: {model_path}")
+            progress(0.7, desc="Moving to GPU...")
+            tts = tts.to(self.device)
             
-            progress(0.5, desc="Loading model weights...")
-            
-            # Load config
-            config_path = os.path.join(model_path, "config.json")
-            if os.path.exists(config_path):
-                self.config = XttsConfig()
-                self.config.load_json(config_path)
-            else:
-                # Use default config
-                self.config = XttsConfig()
-            
-            # Load model
-            self.model = Xtts.init_from_config(self.config)
-            
-            checkpoint_path = os.path.join(model_path, "model.pth")
-            vocab_path = os.path.join(model_path, "vocab.json")
-            
-            if os.path.exists(checkpoint_path):
-                self.model.load_checkpoint(
-                    self.config,
-                    checkpoint_path=checkpoint_path,
-                    vocab_path=vocab_path if os.path.exists(vocab_path) else None,
-                    use_deepspeed=False
-                )
-            else:
-                # Alternative: load from TTS library
-                from TTS.api import TTS
-                tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
-                self.model = tts.synthesizer.tts_model
-                self.config = tts.synthesizer.tts_config
-            
-            self.model = self.model.to(self.device)
-            self.model.eval()
+            self.model = tts.synthesizer.tts_model
+            self.config = tts.synthesizer.tts_config
+            self._tts_api = tts  # Keep reference for simple API
             
             progress(1.0, desc="XTTS model loaded!")
             logger.info(f"XTTS v2 loaded on {self.device}")
@@ -112,7 +97,8 @@ class XTTSInference(TTSBase):
         text: str,
         speaker_wav: Optional[str] = None,
         language: str = "pl",
-        speed: float = 1.0
+        speed: float = 1.0,
+        **kwargs
     ) -> Tuple[bytes, float]:
         """
         Synthesize speech from text
@@ -122,6 +108,7 @@ class XTTSInference(TTSBase):
             speaker_wav: Path to reference audio for voice cloning
             language: Language code (e.g., "pl" for Polish)
             speed: Speech speed multiplier (not directly supported, use sync)
+            **kwargs: Override default TTS params (temperature, top_p, etc.)
             
         Returns:
             Tuple of (audio_bytes as float32, duration_seconds)
@@ -141,6 +128,9 @@ class XTTSInference(TTSBase):
             silence = np.zeros(int(0.5 * self.sample_rate), dtype=np.float32)
             return silence.tobytes(), 0.5
         
+        # Merge params
+        params = {**self.tts_params, **kwargs}
+        
         try:
             # Get speaker embedding
             if speaker_wav and os.path.exists(speaker_wav):
@@ -158,11 +148,11 @@ class XTTSInference(TTSBase):
                     language=language,
                     gpt_cond_latent=gpt_cond_latent,
                     speaker_embedding=speaker_embedding,
-                    temperature=0.7,
-                    length_penalty=1.0,
-                    repetition_penalty=10.0,
-                    top_k=50,
-                    top_p=0.85,
+                    temperature=params['temperature'],
+                    top_p=params['top_p'],
+                    top_k=params['top_k'],
+                    repetition_penalty=params['repetition_penalty'],
+                    length_penalty=params['length_penalty'],
                     enable_text_splitting=True
                 )
             
@@ -189,16 +179,12 @@ class XTTSInference(TTSBase):
     
     def _get_default_speaker(self):
         """Get default speaker embedding when no reference provided"""
-        # Create a simple default voice by using model's default
-        # This is a workaround - ideally user should provide reference
-        
         if self.default_speaker_wav and os.path.exists(self.default_speaker_wav):
             return self.model.get_conditioning_latents(
                 audio_path=[self.default_speaker_wav]
             )
         
         # Generate dummy latents (model will use internal defaults)
-        # This is not ideal but works as fallback
         gpt_cond_latent = torch.zeros(1, 1024).to(self.device)
         speaker_embedding = torch.zeros(1, 512).to(self.device)
         
@@ -229,6 +215,13 @@ class XTTSInference(TTSBase):
         if os.path.exists(speaker_wav):
             self.default_speaker_wav = speaker_wav
             logger.info(f"Default speaker set to: {speaker_wav}")
+    
+    def set_params(self, **kwargs):
+        """Update TTS parameters"""
+        for key in kwargs:
+            if key in self.tts_params:
+                self.tts_params[key] = kwargs[key]
+                logger.info(f"TTS param {key} set to {kwargs[key]}")
     
     def get_available_voices(self) -> List[str]:
         """Get list of available voice presets (if any cached)"""
